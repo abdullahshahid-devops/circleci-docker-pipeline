@@ -1,3 +1,4 @@
+
 version: 2.1
 
 jobs:
@@ -27,52 +28,200 @@ jobs:
     steps:
       - checkout
       - setup_remote_docker
+
       - run:
           name: Build Docker image
           command: |
-            docker build -t $DOCKER_USERNAME/circleci-docker-pipeline:$CIRCLE_SHA1 .
+            docker build \
+              -t "$DOCKER_USERNAME/circleci-docker-pipeline:$CIRCLE_SHA1" .
+
       - run:
           name: Smoke test Docker image
           command: |
-            docker run -d --name app-test \
-              $DOCKER_USERNAME/circleci-docker-pipeline:$CIRCLE_SHA1
+            IMAGE="$DOCKER_USERNAME/circleci-docker-pipeline:$CIRCLE_SHA1"
 
+            docker run -d --name app-test "$IMAGE"
             sleep 5
 
-            docker ps -a
             docker logs app-test
 
-            docker exec app-test node -e "
-              require('http').get('http://127.0.0.1:3000/health', r => {
-                console.log('HTTP Status:', r.statusCode);
+            docker exec app-test node -e '
+              require("http").get("http://127.0.0.1:3000/health", r => {
+                console.log("HTTP Status:", r.statusCode);
                 process.exit(r.statusCode === 200 ? 0 : 1);
-              }).on('error', e => {
+              }).on("error", e => {
                 console.error(e);
                 process.exit(1);
               });
-            "
+            '
 
             docker rm -f app-test
+
+      - run:
+          name: Install Trivy and scan image
+          command: |
+            set -eo pipefail
+
+            mkdir -p "$HOME/bin"
+
+            curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+              | sh -s -- -b "$HOME/bin"
+
+            export PATH="$HOME/bin:$PATH"
+
+            docker save \
+              -o image.tar \
+              "$DOCKER_USERNAME/circleci-docker-pipeline:$CIRCLE_SHA1"
+
+            trivy image \
+              --input image.tar \
+              --scanners vuln \
+              --severity HIGH,CRITICAL \
+              --format json \
+              --output trivy-report.json
+
+      - store_artifacts:
+          path: trivy-report.json
+          destination: trivy-report.json
+
+      - run:
+          name: Enforce vulnerability security gate
+          command: |
+            python3 -c '
+            import json, sys
+
+            report = json.load(open("trivy-report.json"))
+            vulnerabilities = [
+                v
+                for result in (report.get("Results") or [])
+                for v in (result.get("Vulnerabilities") or [])
+            ]
+
+            critical = sum(v.get("Severity") == "CRITICAL" for v in vulnerabilities)
+            high = sum(v.get("Severity") == "HIGH" for v in vulnerabilities)
+
+            print("CRITICAL:", critical)
+            print("HIGH:", high)
+
+            if critical:
+                print("CRITICAL vulnerabilities found. Failing pipeline.")
+                sys.exit(1)
+
+            if high:
+                print("WARNING: HIGH vulnerabilities found.")
+
+            print("Security gate passed.")
+            '
+
       - run:
           name: Login and push to Docker Hub
           command: |
-            echo "$DOCKER_PASSWORD" | docker login -u "$DOCKER_USERNAME" --password-stdin
+            IMAGE="$DOCKER_USERNAME/circleci-docker-pipeline"
 
-            docker push $DOCKER_USERNAME/circleci-docker-pipeline:$CIRCLE_SHA1
+            echo "$DOCKER_PASSWORD" | docker login \
+              -u "$DOCKER_USERNAME" --password-stdin
 
-            docker tag \
-              $DOCKER_USERNAME/circleci-docker-pipeline:$CIRCLE_SHA1 \
-              $DOCKER_USERNAME/circleci-docker-pipeline:latest
+            docker push "$IMAGE:$CIRCLE_SHA1"
 
-            docker push $DOCKER_USERNAME/circleci-docker-pipeline:latest
+            docker tag "$IMAGE:$CIRCLE_SHA1" "$IMAGE:$CIRCLE_BRANCH"
+            docker push "$IMAGE:$CIRCLE_BRANCH"
+
+            docker tag "$IMAGE:$CIRCLE_SHA1" "$IMAGE:latest"
+            docker push "$IMAGE:latest"
+
+  deploy-staging:
+    docker:
+      - image: cimg/base:current
+    steps:
+      - setup_remote_docker
+
+      - run:
+          name: Pull image and run staging container
+          command: |
+            IMAGE="$DOCKER_USERNAME/circleci-docker-pipeline:$CIRCLE_SHA1"
+
+            echo "$DOCKER_PASSWORD" | docker login \
+              -u "$DOCKER_USERNAME" --password-stdin
+
+            RESULT=failed
+
+            docker pull "$IMAGE"
+            PULL_STATUS=$?
+
+            if [ "$PULL_STATUS" -eq 0 ]; then
+              docker run -d --name staging-app "$IMAGE"
+              RUN_STATUS=$?
+
+              if [ "$RUN_STATUS" -eq 0 ]; then
+                sleep 5
+
+                docker exec staging-app node -e '
+                  require("http").get("http://127.0.0.1:3000/health", r => {
+                    let body = "";
+                    r.on("data", chunk => body += chunk);
+                    r.on("end", () => {
+                      console.log("HTTP Status:", r.statusCode);
+                      console.log("Response:", body);
+                      process.exit(
+                        r.statusCode === 200 &&
+                        body === "{\"status\":\"healthy\"}" ? 0 : 1
+                      );
+                    });
+                  }).on("error", e => {
+                    console.error(e);
+                    process.exit(1);
+                  });
+                '
+
+                TEST_STATUS=$?
+
+                if [ "$TEST_STATUS" -eq 0 ]; then
+                  RESULT=passed
+                fi
+              fi
+            fi
+
+            docker rm -f staging-app >/dev/null 2>&1 || true
+
+            TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+            printf '{"image":"%s","pipeline_number":"%s","timestamp":"%s","result":"%s"}\n' \
+              "$IMAGE" "$CIRCLE_PIPELINE_NUM" "$TIMESTAMP" "$RESULT" \
+              > deploy-manifest.json
+
+            echo "$RESULT" > deployment-status.txt
+
+            cat deploy-manifest.json
+
+      - store_artifacts:
+          path: deploy-manifest.json
+          destination: deploy-manifest.json
+
+      - run:
+          name: Verify staging deployment
+          command: |
+            if [ "$(cat deployment-status.txt)" != "passed" ]; then
+              echo "Staging deployment failed."
+              exit 1
+            fi
+
+            echo "Staging deployment passed."
 
 workflows:
   build-test-deploy:
     jobs:
       - test
+
       - build-and-push:
           requires:
             - test
+          filters:
+            branches:
+              only: main
+
+      - deploy-staging:
+          requires:
+            - build-and-push
           filters:
             branches:
               only: main
