@@ -34,17 +34,24 @@ jobs:
       - run:
           name: Smoke test Docker image
           command: |
-            docker run -d --name app-test -p 3000:3000 \
+            docker run -d --name app-test \
               $DOCKER_USERNAME/circleci-docker-pipeline:$CIRCLE_SHA1
 
-            for i in $(seq 1 15); do
-              if curl -fsS http://localhost:3000/health; then
-                break
-              fi
-              sleep 2
-            done
+            sleep 5
 
-            curl -fsS http://localhost:3000/health
+            docker ps -a
+            docker logs app-test
+
+            docker exec app-test node -e "
+              require('http').get('http://127.0.0.1:3000/health', r => {
+                console.log('HTTP Status:', r.statusCode);
+                process.exit(r.statusCode === 200 ? 0 : 1);
+              }).on('error', e => {
+                console.error(e);
+                process.exit(1);
+              });
+            "
+
             docker rm -f app-test
       - run:
           name: Login and push to Docker Hub
