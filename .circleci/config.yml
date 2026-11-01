@@ -4,30 +4,68 @@ jobs:
   test:
     docker:
       - image: cimg/node:18.20
-
     working_directory: ~/circleci-docker-pipeline
-
     steps:
       - checkout
-
       - restore_cache:
           keys:
             - npm-deps-v1-{{ checksum "package-lock.json" }}
-
       - run:
           name: Install dependencies
           command: npm ci
-
       - save_cache:
           key: npm-deps-v1-{{ checksum "package-lock.json" }}
           paths:
             - node_modules
-
       - run:
           name: Run unit tests
           command: npm test
+
+  build-and-push:
+    docker:
+      - image: cimg/base:current
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run:
+          name: Build Docker image
+          command: |
+            docker build -t $DOCKER_USERNAME/circleci-docker-pipeline:$CIRCLE_SHA1 .
+      - run:
+          name: Smoke test Docker image
+          command: |
+            docker run -d --name app-test -p 3000:3000 \
+              $DOCKER_USERNAME/circleci-docker-pipeline:$CIRCLE_SHA1
+
+            for i in $(seq 1 15); do
+              if curl -fsS http://localhost:3000/health; then
+                break
+              fi
+              sleep 2
+            done
+
+            curl -fsS http://localhost:3000/health
+            docker rm -f app-test
+      - run:
+          name: Login and push to Docker Hub
+          command: |
+            echo "$DOCKER_PASSWORD" | docker login -u "$DOCKER_USERNAME" --password-stdin
+
+            docker push $DOCKER_USERNAME/circleci-docker-pipeline:$CIRCLE_SHA1
+
+            docker tag \
+              $DOCKER_USERNAME/circleci-docker-pipeline:$CIRCLE_SHA1 \
+              $DOCKER_USERNAME/circleci-docker-pipeline:latest
+
+            docker push $DOCKER_USERNAME/circleci-docker-pipeline:latest
 
 workflows:
   build-test-deploy:
     jobs:
       - test
+      - build-and-push:
+          requires:
+            - test
+          filters:
+            branches:
+              only: main
