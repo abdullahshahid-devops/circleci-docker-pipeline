@@ -1,5 +1,4 @@
 node_modules
 .git
 .circleci
-tests
 npm-debug.log

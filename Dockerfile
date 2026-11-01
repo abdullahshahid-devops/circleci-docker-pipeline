@@ -12,6 +12,10 @@ FROM node:18-alpine AS production
 
 WORKDIR /app
 
+# Force production build to depend on successful test stage
+COPY --from=test /app/package-lock.json /tmp/package-lock.json
+RUN rm /tmp/package-lock.json
+
 COPY package*.json ./
 RUN npm ci --omit=dev && npm cache clean --force
 
